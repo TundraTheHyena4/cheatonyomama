@@ -1,0 +1,1785 @@
+"use strict";
+
+var test = require("tap").test;
+var fs = require("fs");
+var crypto = require("crypto");
+var http = require("http");
+var concat = require("concat-stream");
+var getServers = require("./test_utils.js").getServers;
+const Unblocker = require("../lib/unblocker.js");
+
+// source is http://qa-dev.w3.org/wmvs/HEAD/dev/tests/xhtml-windows-1250.xhtml which is linked to from http://validator.w3.org/dev/tests/#encoding
+var sourceContent = fs.readFileSync(
+  __dirname + "/source/xhtml-windows-1250.xhtml"
+);
+var expected = fs.readFileSync(
+  __dirname + "/expected/xhtml-windows-1250-converted-to-utf-8.xhtml"
+);
+
+// first validate that the IDE or whatever didn't change the file encoding
+var SOURCE_HASH = "11f694099b205b26a19648ab22602b39c6deb125";
+var EXPECTED_HASH = "4a04a0aa660da6f0eec9534c0e25212a7045ea7c";
+test("source and expected xhtml-windows-1250.xhtml files should not have changed", function (t) {
+  t.equal(
+    crypto.createHash("sha1").update(sourceContent).digest("hex"),
+    SOURCE_HASH
+  );
+  t.equal(
+    crypto.createHash("sha1").update(expected).digest("hex"),
+    EXPECTED_HASH
+  );
+  t.end();
+});
+
+test("should properly decode and update non-native charsets when charset is in header", function (t) {
+  t.plan(1);
+  getServers(
+    {
+      unblocker: new Unblocker({ clientScripts: false }),
+      sourceContent,
+      charset: "windows-1250",
+    },
+    function (err, servers) {
+      http
+        .get(servers.proxiedUrl, function (res) {
+          res.pipe(
+            concat(function (actual) {
+              servers.kill();
+              t.same(actual, expected);
+            })
+          );
+        })
+        .on("error", function (e) {
+          t.bailout(e);
+        });
+    }
+  );
+});
+
+test("should properly decode and update charsets when charset is in body", function (t) {
+  t.plan(1);
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      http
+        .get(servers.proxiedUrl, function (res) {
+          res.pipe(
+            concat(function (actual) {
+              servers.kill();
+              t.same(actual, expected);
+            })
+          );
+        })
+        .on("error", function (e) {
+          t.bailout(e);
+        });
+    }
+  );
+});
+
+test("should still work when charset can be determined", function (t) {
+  t.plan(1);
+  var sourceContent = "<h1>test</h1>",
+    expected = "<h1>test</h1>";
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      http
+        .get(servers.proxiedUrl, function (res) {
+          res.pipe(
+            concat(function (actual) {
+              servers.kill();
+              t.same(actual.toString(), expected);
+            })
+          );
+        })
+        .on("error", function (e) {
+          t.bailout(e);
+        });
+    }
+  );
+});
+
+"use strict";
+
+var test = require("tap").test;
+var contentTypes = require("../lib/content-types.js");
+
+test("should handle content types with a charset", function (t) {
+  var config = {
+    processContentTypes: ["text/html"],
+  };
+  var data = {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+    },
+  };
+  data.contentType = contentTypes.getType(data);
+  t.ok(contentTypes.shouldProcess(config, data));
+  t.end();
+});
+
+"use strict";
+
+var test = require("tap").test,
+  utils = require("./test_utils.js"),
+  getData = utils.getData,
+  cookies = require("../lib/cookies.js"),
+  PassThrough = require("stream").PassThrough,
+  concat = require("concat-stream");
+
+test("should copy cookies and redirect in response to a __proxy_cookies_to query param", function (t) {
+  t.plan(2);
+  var instance = cookies({
+    prefix: "/proxy/",
+    processContentTypes: [],
+  });
+  var data = getData();
+  data.url += "?__proxy_cookies_to=https%3A%2F%2Fexample.com%2F";
+  data.headers.cookie = "one=1; two=2; three=3";
+  data.clientResponse = {
+    redirectTo: function (path, headers) {
+      var expectedPath = "https://example.com/";
+      var expectedHeaders = {
+        "set-cookie": [
+          "one=1; Path=/proxy/https://example.com/",
+          "two=2; Path=/proxy/https://example.com/",
+          "three=3; Path=/proxy/https://example.com/",
+        ],
+      };
+      t.equal(path, expectedPath);
+      t.same(headers, expectedHeaders);
+      t.end();
+    },
+  };
+  instance.handleRequest(data);
+});
+
+test("should rewrite set-cookie paths", function (t) {
+  var instance = cookies({
+    prefix: "/proxy/",
+    processContentTypes: [],
+  });
+  var data = getData();
+  data.headers["set-cookie"] = ["one=1", "two=2; path=/", "three=3; path=/foo"];
+  instance.handleResponse(data);
+  var expected = [
+    "one=1; Path=/proxy/http://example.com/",
+    "two=2; Path=/proxy/http://example.com/",
+    "three=3; Path=/proxy/http://example.com/foo",
+  ];
+  var actual = data.headers["set-cookie"];
+  t.same(actual, expected);
+  t.end();
+});
+
+test("should rewrite the cookie that is percent-encoded correctly", function (t) {
+  var instance = cookies({
+    prefix: "/proxy/",
+    processContentTypes: [],
+  });
+  var data = getData();
+  data.headers["set-cookie"] = [
+    "asdf=asdf%3Basdf%3Dtrue%3Basdf%3Dasdf%3Basdf%3Dtrue%40asdf",
+  ];
+  instance.handleResponse(data);
+  var expected = [
+    "asdf=asdf%3Basdf%3Dtrue%3Basdf%3Dasdf%3Basdf%3Dtrue%40asdf; Path=/proxy/http://example.com/",
+  ];
+  var actual = data.headers["set-cookie"];
+  t.same(actual, expected);
+  t.end();
+});
+
+test("should copy any missing cookies to a 3xx redirect", function (t) {
+  t.plan(1);
+  var instance = cookies({
+    prefix: "/proxy/",
+    processContentTypes: ["text/html"],
+  });
+  var data = getData();
+  data.clientRequest = {
+    headers: {
+      cookie: "one=oldvalue; two=2",
+    },
+  };
+  data.headers = {
+    "set-cookie": "one=1; Path=/; HttpOnly",
+  };
+  data.redirectUrl = "https://example.com/"; // this is normally set by the redirects middleware before it changes the location header
+  instance.handleResponse(data);
+  var expected = {
+    "set-cookie": [
+      "one=1; Path=/proxy/https://example.com/; HttpOnly",
+      "two=2; Path=/proxy/https://example.com/",
+    ],
+  };
+  t.same(data.headers, expected);
+});
+
+test("should rewrite urls that change subdomain or protocol (but not domain)", function (t) {
+  t.plan(2);
+  var instance = cookies({
+    prefix: "/proxy/",
+    processContentTypes: ["text/html"],
+  });
+  var data = getData();
+  var sourceStream = new PassThrough({
+    encoding: "utf8",
+  });
+  data.stream = sourceStream;
+  instance.handleResponse(data);
+  t.notEqual(
+    data.stream,
+    sourceStream,
+    "cookies.handleResponse should create a new stream to process content"
+  );
+  var source = [
+    '<a href="/proxy/http://example.com/">no change</a>',
+    '<a href="/proxy/https://example.com/">new proto</a>',
+    '<a href="/proxy/http://sub.example.com/">new subdomain</a>',
+    '<a href="/proxy/http://othersite.com/">other site, same proto</a>',
+    '<a href="/proxy/https://othersite.com/">other site, dif proto</a>',
+    '<a href="javascript:void(0)" onclick="window.open(\'/proxy/http://sub.example.com/\')">new subdomain using inline JS</a>',
+    '<img src="/proxy/http://example.com/img.jpg" alt="no change" />',
+    '<img src="/proxy/https://example.com/img.jpg" alt="new proto">',
+  ].join("\n");
+
+  var expected = [
+    '<a href="/proxy/http://example.com/">no change</a>',
+    '<a href="/proxy/http://example.com/?__proxy_cookies_to=https%3A%2F%2Fexample.com%2F">new proto</a>',
+    '<a href="/proxy/http://example.com/?__proxy_cookies_to=http%3A%2F%2Fsub.example.com%2F">new subdomain</a>',
+    '<a href="/proxy/http://othersite.com/">other site, same proto</a>',
+    '<a href="/proxy/https://othersite.com/">other site, dif proto</a>',
+    '<a href="javascript:void(0)" onclick="window.open(\'/proxy/http://example.com/?__proxy_cookies_to=http%3A%2F%2Fsub.example.com%2F\')">new subdomain using inline JS</a>',
+    '<img src="/proxy/http://example.com/img.jpg" alt="no change" />',
+    '<img src="/proxy/http://example.com/img.jpg?__proxy_cookies_to=https%3A%2F%2Fexample.com%2Fimg.jpg" alt="new proto">',
+  ].join("\n");
+
+  data.stream.setEncoding("utf8");
+  data.stream.pipe(
+    concat(function (actual) {
+      t.equal(actual, expected);
+      t.end();
+    })
+  );
+
+  sourceStream.end(source);
+});
+
+test("should work with SameSite attributes", function (t) {
+  var instance = cookies({
+    prefix: "/proxy/",
+    processContentTypes: [],
+  });
+  var data = getData();
+  data.headers["set-cookie"] = [
+    "1P_JAR=2019-12-19-00; expires=Sat, 18-Jan-2020 00:42:02 GMT; path=/; domain=.google.com; SameSite=none",
+  ];
+  instance.handleResponse(data);
+  var actual = data.headers["set-cookie"][0];
+  console.log(actual);
+  t.assert(actual.toLowerCase().indexOf("samesite=none") > -1);
+  t.end();
+});
+
+"use strict";
+
+var PassThrough = require("stream").PassThrough;
+var zlib = require("zlib");
+var test = require("tap").test;
+var concat = require("concat-stream");
+var decompress = require("../lib/decompress.js");
+var defaultConfig = require("../lib/unblocker.js").defaultConfig;
+
+test("should decompress data compressed with gzip", function (t) {
+  var source = zlib.createGzip();
+  var data = {
+    remoteResponse: {
+      statusCode: 200,
+    },
+    headers: {
+      "content-encoding": "gzip",
+    },
+    contentType: "text/html",
+    stream: source,
+  };
+  var content = "this is some content to compress and decompress";
+  var expected = content;
+
+  decompress(defaultConfig).handleResponse(data);
+
+  t.notEqual(
+    source,
+    data.stream,
+    "it should create a new stream for decompression"
+  );
+
+  t.notOk(
+    data.headers["content-encoding"],
+    "it should remove the encoding header when decompressing"
+  );
+
+  data.stream.pipe(
+    concat(function (data) {
+      var actual = data.toString();
+      t.same(actual, expected);
+      t.end();
+    })
+  );
+
+  source.end(content);
+});
+
+test("should decompress data compressed with deflate", function (t) {
+  var source = zlib.createDeflate();
+  var data = {
+    remoteResponse: {
+      statusCode: 200,
+    },
+    headers: {
+      "content-encoding": "deflate",
+    },
+    contentType: "text/html",
+    stream: source,
+  };
+  var content = "this is some content to compress and decompress";
+  var expected = content;
+
+  decompress(defaultConfig).handleResponse(data);
+
+  t.notEqual(
+    source,
+    data.stream,
+    "it should create a new stream for decompression"
+  );
+
+  t.notOk(
+    data.headers["content-encoding"],
+    "it should remove the encoding header when decompressing"
+  );
+
+  data.stream.pipe(
+    concat(function (data) {
+      var actual = data.toString();
+      t.same(actual, expected);
+      t.end();
+    })
+  );
+
+  source.end(content);
+});
+
+test("should skip requests with no content (#105)", function (t) {
+  var source = new PassThrough();
+  var data = {
+    remoteResponse: {
+      statusCode: 304,
+    },
+    headers: {
+      "content-encoding": "gzip",
+    },
+    contentType: "text/html",
+    stream: source,
+  };
+
+  decompress(defaultConfig).handleResponse(data);
+
+  t.equal(
+    data.headers["content-encoding"],
+    "gzip",
+    "it should keep the encoding header when skipping"
+  );
+
+  t.equal(
+    source,
+    data.stream,
+    "it should not change the stream when it can tell there's no content"
+  );
+  t.end();
+});
+
+test("should skip requests with no content, even if it can't tell ahead of time", function (t) {
+  var source = new PassThrough();
+  var data = {
+    remoteResponse: {
+      statusCode: 200,
+    },
+    headers: {
+      "content-encoding": "gzip",
+    },
+    contentType: "text/html",
+    stream: source,
+  };
+
+  decompress(defaultConfig).handleResponse(data);
+
+  t.notEqual(
+    source,
+    data.stream,
+    "it should create a new stream for decompression"
+  );
+
+  data.stream.on("end", function () {
+    t.end();
+  });
+
+  data.stream.resume(); // put the stream into flowing mode so that 'end' fires
+  source.end();
+});
+
+test("should request only gzip if the client supports multiple encodings (#151)", function (t) {
+  var data = {
+    headers: {
+      "accept-encoding": "deflate, gzip",
+    },
+  };
+
+  decompress(defaultConfig).handleRequest(data);
+
+  t.equal(
+    data.headers["accept-encoding"],
+    "gzip",
+    "it should change the header to gzip only"
+  );
+  t.end();
+});
+
+test("should remove the accept-encoding header if the client does not support gzip", function (t) {
+  var data = {
+    headers: {
+      "accept-encoding": "deflate",
+    },
+  };
+
+  decompress(defaultConfig).handleRequest(data);
+
+  t.notOk(
+    data.headers["accept-encoding"],
+    "it should remove unsupported encodings"
+  );
+  t.end();
+});
+
+"use strict";
+
+var it = require("tap").test,
+  getRealUrl = require("../lib/get-real-url.js");
+
+var config = {
+  prefix: "/proxy/",
+};
+
+var instance = getRealUrl(config);
+
+it("should extract the url", function (t) {
+  t.equal(instance("/proxy/http://example.com/"), "http://example.com/");
+  t.end();
+});
+
+it("should extract incpmplete urls", function (t) {
+  t.equal(instance("/proxy/example.com/"), "example.com/");
+  t.end();
+});
+
+it("should keep querystring data", function (t) {
+  t.equal(
+    instance("/proxy/http://example.com/?foo=bar"),
+    "http://example.com/?foo=bar"
+  );
+  t.end();
+});
+
+it("should should fix merged slashes (http:/ instead of http://", function (t) {
+  t.equal(instance("/proxy/http:/example.com/"), "http://example.com/");
+  t.equal(instance("/proxy/https:/example.com/"), "https://example.com/");
+  t.end();
+});
+
+it("should fix double-prefixed urls)", function (t) {
+  t.equal(
+    instance("/proxy/http://proxy/http://example.com/"),
+    "http://example.com/"
+  );
+  t.equal(
+    instance("/proxy/http:/proxy/http://example.com/"),
+    "http://example.com/"
+  );
+  t.equal(
+    instance("/proxy/https://proxy/https://example.com/"),
+    "https://example.com/"
+  );
+  t.end();
+});
+
+"use strict";
+
+var test = require("tap").test,
+  concat = require("concat-stream"),
+  utils = require("./test_utils.js"),
+  getData = utils.getData,
+  defaultConfig = require("../lib/unblocker").defaultConfig;
+
+var metaRobots = require("../lib/meta-robots.js");
+
+var head = "<html><head><title>test</title></head>";
+var body = "<body><p>asdf</p></body></html>";
+
+test("should add a meta tag to the head", function (t) {
+  var expected =
+    '<html><head><title>test</title><meta name="ROBOTS" content="NOINDEX, NOFOLLOW"/>\n</head>';
+  var stream = metaRobots().createStream();
+  stream.setEncoding("utf8");
+  stream.pipe(
+    concat(function (actual) {
+      t.equal(actual, expected);
+      t.end();
+    })
+  );
+  stream.end(head);
+});
+
+test("should do nothing to the body", function (t) {
+  var expected = body;
+  var stream = metaRobots().createStream();
+  stream.setEncoding("utf8");
+  stream.pipe(
+    concat(function (actual) {
+      t.equal(actual, expected);
+      t.end();
+    })
+  );
+  stream.end(body);
+});
+
+test("should not modify javascript", function (t) {
+  var config = Object.assign({}, defaultConfig);
+  var instance = metaRobots(config);
+  var data = getData();
+  data.contentType = "text/javascript";
+  var streamStart = data.stream;
+  streamStart.setEncoding("utf8");
+  instance(data); // this will replace data.stream when modifying the contents
+  var streamEnd = data.stream;
+
+  // commented out so that we can test the results rather than the implimentation details
+  //t.equal(streamStart, streamEnd);
+
+  var js = `document.write('${head}')`;
+  var expected = js;
+
+  streamEnd.setEncoding("utf8");
+  streamEnd.pipe(
+    concat(function (actual) {
+      t.equal(actual, expected);
+      t.end();
+    })
+  );
+  streamStart.end(js);
+});
+
+"use strict";
+const path = require("path");
+const { format } = require("util");
+const send = require("send");
+const concat = require("concat-stream");
+const hyperquest = require("hyperquest");
+const math = require("math-helpers")();
+const async = require("async");
+const { getServers } = require("./test_utils.js");
+
+const html_path = path.join(__dirname, "source/index.html");
+const js_path = path.join(
+  __dirname,
+  "source/desktop_polymer_inlined_html_polymer_flags.js"
+);
+
+function remoteApp(req, res) {
+  if (req.url === "/js") {
+    send(req, js_path).pipe(res);
+  } else {
+    send(req, html_path).pipe(res);
+  }
+}
+
+// fire up the server and actually run the tests
+getServers({ remoteApp }, function (err, servers) {
+  // set up the cleanup work first
+  //process.on('SIGINT', servers.kill);
+  //process.on('SIGTERM', servers.kill);
+  if (err) {
+    throw err;
+  }
+
+  const iterations_html = 1000;
+  const concurrency_html = 30;
+
+  const iterations_js = 100;
+  const concurrency_js = 4; // note: this entire test (client and server) runs on a single thread
+
+  var baseline, proxy;
+
+  new async.series(
+    [
+      function (next) {
+        runTest(
+          "Baseline HTML",
+          servers.remoteUrl,
+          iterations_html,
+          concurrency_html,
+          function (baseFailures, baseSuccesses, time) {
+            baseline = getStats(
+              iterations_html,
+              baseFailures,
+              baseSuccesses,
+              time
+            );
+            printStats(baseline);
+            next();
+          }
+        );
+      },
+      function (next) {
+        runTest(
+          "Proxy HTML",
+          servers.proxiedUrl,
+          iterations_html,
+          concurrency_html,
+          function (proxyFailures, proxySuccesses, time) {
+            proxy = getStats(
+              iterations_html,
+              proxyFailures,
+              proxySuccesses,
+              time
+            );
+            printStats(proxy, baseline);
+            next();
+          }
+        );
+      },
+      function (next) {
+        runTest(
+          "Baseline JS",
+          servers.remoteUrl + "js",
+          iterations_js,
+          concurrency_js,
+          function (baseFailures, baseSuccesses, time) {
+            baseline = getStats(
+              iterations_js,
+              baseFailures,
+              baseSuccesses,
+              time
+            );
+            printStats(baseline);
+            next();
+          }
+        );
+      },
+      function (next) {
+        runTest(
+          "Proxy JS",
+          servers.proxiedUrl + "js",
+          iterations_js,
+          concurrency_js,
+          function (proxyFailures, proxySuccesses, time) {
+            proxy = getStats(
+              iterations_js,
+              proxyFailures,
+              proxySuccesses,
+              time
+            );
+            printStats(proxy, baseline);
+            next();
+          }
+        );
+      },
+    ],
+    function (err) {
+      console.log(err || "");
+      servers.kill();
+    }
+  );
+});
+
+function runTest(name, url, iterations, concurrency, cb) {
+  console.log("\n\n=========\n" + name + "\n=========");
+
+  const start = Date.now();
+  const times = [];
+  const failures = [];
+  const tasks = [];
+
+  function addTask() {
+    tasks.push(function (step) {
+      var start = Date.now();
+      hyperquest(url)
+        .pipe(
+          concat(function (data) {
+            if (!data || !data.length) {
+              throw new Error("No data: " + data);
+            }
+            const time = Date.now() - start;
+            times.push(time);
+            process.stdout.write(".");
+            step();
+          })
+        )
+        .on("error", function (err) {
+          err.time = Date.now() - start;
+          failures.push(err);
+          process.stdout.write("x");
+          step(err);
+        });
+    });
+  }
+
+  for (var i = 0; i < iterations; i++) {
+    addTask();
+  }
+
+  async.parallelLimit(tasks, concurrency, function (err) {
+    if (err) failures.push(err);
+    var totalTime = Date.now() - start;
+    cb(failures, times, totalTime);
+  });
+}
+
+function getStats(iterations, failures, successes, time) {
+  var sorted = successes.sort();
+  return {
+    iterations: iterations,
+    failures: failures.length,
+    successes: successes.length,
+    ms: time,
+    average: math.avg(successes),
+    stdDev: math.stdDev(successes),
+    _50: sorted[Math.round(sorted.length / 2)],
+    _75: sorted[Math.round((sorted.length / 4) * 3)],
+    _90: sorted[Math.round((sorted.length / 10) * 9)],
+    _95: sorted[Math.round((sorted.length / 20) * 19)],
+  };
+}
+
+function printDifference(stat, proxy, baseline) {
+  if (!baseline) return "";
+  var percentageDiff = (proxy[stat] * 100) / baseline[stat] - 100;
+  return format(
+    "(%s% %s than the baseline)",
+    Math.round(Math.abs(percentageDiff)),
+    percentageDiff > 0 ? "slower" : "faster"
+  );
+}
+
+function printStats(stats, baseline) {
+  if (stats.failures) {
+    console.error(stats.failures + " failures");
+  }
+  console.log(
+    format(
+      "\n%s/%s iterations completed successfully in %s miliseconds %s",
+      stats.successes,
+      stats.iterations,
+      stats.ms,
+      printDifference("ms", stats, baseline)
+    )
+  );
+  console.log(
+    "Average response time: " + stats.average + " miliseconds",
+    printDifference("average", stats, baseline)
+  );
+  if (baseline) {
+    console.log(
+      format(
+        "Proxy adds %s ms to each request on average",
+        stats.average - baseline.average
+      )
+    );
+  }
+  console.log(
+    "Standard Deviation: " + stats.stdDev,
+    printDifference("stdDev", stats, baseline)
+      .replace("slower", "worse")
+      .replace("faster", "better")
+  );
+  console.log(
+    format(
+      "Percentile speeds:\n  50%: %sms %s\n  75%: %sms %s\n  90%: %sms %s\n  95%: %sms %s",
+      stats._50,
+      printDifference("_50", stats, baseline),
+      stats._75,
+      printDifference("_75", stats, baseline),
+      stats._90,
+      printDifference("_90", stats, baseline),
+      stats._95,
+      printDifference("_95", stats, baseline)
+    )
+  );
+}
+
+"use strict";
+
+var redirect = require("../lib/redirects.js");
+var test = require("tap").test;
+
+test("should correctly redirect with http://", function (t) {
+  var expected = "http://foobar.com/proxy/http://example.com/not-a-test/";
+  var data = {
+    url: "http://example.com/test/",
+    headers: {
+      location: "http://example.com/not-a-test/",
+    },
+    clientRequest: {
+      thisSite: function () {
+        return "http://foobar.com/proxy/";
+      },
+    },
+  };
+  redirect()(data);
+  t.equal(data.headers.location, expected);
+  t.end();
+});
+
+test("should correctly redirect with //", function (t) {
+  var expected = "http://foobar.com/proxy/http://example.com/not-a-test/";
+  var data = {
+    url: "http://example.com/test/",
+    headers: {
+      location: "//example.com/not-a-test/",
+    },
+    clientRequest: {
+      thisSite: function () {
+        return "http://foobar.com/proxy/";
+      },
+    },
+  };
+  redirect()(data);
+  t.equal(data.headers.location, expected);
+  t.end();
+});
+
+test("should correctly redirect with // and https", function (t) {
+  var expected = "http://foobar.com/proxy/https://example.com/not-a-test/";
+  var data = {
+    url: "https://example.com/test/",
+    headers: {
+      location: "//example.com/not-a-test/",
+    },
+    clientRequest: {
+      thisSite: function () {
+        return "http://foobar.com/proxy/";
+      },
+    },
+  };
+  redirect()(data);
+  t.equal(data.headers.location, expected);
+  t.end();
+});
+
+"use strict";
+
+var referer = require("../lib/referer.js");
+var test = require("tap").test;
+
+test("should correctly rewrite referers", function (t) {
+  var expected = "http://foobar.com/proxy/a";
+  var data = {
+    url: "http://foobar.com/b",
+    headers: {
+      referer: "http://localhost:8080/proxy/" + expected,
+    },
+  };
+  referer({
+    prefix: "/proxy/",
+  })(data);
+  t.equal(data.headers.referer, expected);
+  t.end();
+});
+
+"use strict";
+
+var fs = require("fs"),
+  concat = require("concat-stream"),
+  test = require("tap").test,
+  hyperquest = require("hyperquest"),
+  getServers = require("./test_utils.js").getServers;
+
+var source = fs.readFileSync(__dirname + "/source/short.html");
+var expected = fs.readFileSync(__dirname + "/expected/short.html");
+
+test("url_rewriting should support short html documents", function (t) {
+  getServers(source, function (err, servers) {
+    function cleanup() {
+      servers.kill(function () {
+        t.end();
+      });
+    }
+    hyperquest(servers.proxiedUrl)
+      .pipe(
+        concat(function (data) {
+          t.equal(
+            data.toString(),
+            expected.toString().replace(/<remotePort>/g, servers.remotePort)
+          );
+          cleanup();
+        })
+      )
+      .on("error", function (err) {
+        console.error("error retrieving data from proxy", err);
+        cleanup();
+      });
+  });
+});
+
+"use strict";
+
+const http = require("http");
+const async = require("async");
+const { PassThrough } = require("stream");
+const Unblocker = require("../lib/unblocker.js");
+
+function getUnblocker(options) {
+  if (options.unblocker) {
+    return options.unblocker;
+  }
+  return new Unblocker({});
+}
+
+function getProxyApp(unblocker) {
+  function app(req, res) {
+    // first let unblocker try to handle the requests
+    unblocker(req, res, function (err) {
+      // this callback will be fired for any request that unblocker does not serve
+      const headers = {
+        "content-type": "text/plain",
+      };
+      if (err) {
+        console.error(err);
+        res.writeHead(500, headers);
+        return res.end(err.stack || err.message);
+      }
+      if (req.url == "/") {
+        res.writeHead(200, headers);
+        return res.end("this is the home page");
+      } else {
+        res.writeHead(404, headers);
+        return res.end("Error 404: file not found.");
+      }
+    });
+  }
+
+  return app;
+}
+
+/**
+ * Creates two servers, a proxy instance and a remote server that serves up sourceContent
+ * @param options|sourceContent
+ *  - options is an object with one or more of {sourceContent,charset,remoteApp,proxyApp},
+ *  or
+ *  - sourceContent can be a buffer or string that is automatically served by the default remoteApp
+ * @param next
+ */
+exports.getServers = function (options, next) {
+  if (typeof options == "string" || options instanceof Buffer) {
+    options = {
+      sourceContent: options,
+    };
+  }
+
+  const remoteApp =
+    options.remoteApp ||
+    function sendContent(req, res) {
+      res.writeHead(200, {
+        "content-type":
+          "text/html" + (options.charset ? "; charset=" + options.charset : ""),
+      });
+      res.end(options.sourceContent);
+    };
+
+  const unblocker = getUnblocker(options);
+
+  const proxyApp = options.proxyApp || getProxyApp(unblocker);
+
+  const proxyServer = http.createServer(proxyApp);
+  const remoteServer = http.createServer(remoteApp);
+
+  proxyServer.setTimeout(5000);
+  remoteServer.setTimeout(5000);
+
+  proxyServer.on("upgrade", unblocker.onUpgrade);
+
+  async.parallel(
+    [
+      proxyServer.listen.bind(proxyServer),
+      remoteServer.listen.bind(remoteServer),
+    ],
+    function (err) {
+      if (err) {
+        return next(err);
+      }
+      const ret = {
+        proxyServer: proxyServer,
+        proxyPort: proxyServer.address().port,
+        remoteServer: remoteServer,
+        remotePort: remoteServer.address().port,
+        kill: function (next) {
+          async.parallel(
+            [
+              remoteServer.close.bind(remoteServer),
+              proxyServer.close.bind(proxyServer),
+            ],
+            next
+          );
+        },
+      };
+      ret.homeUrl = "http://localhost:" + ret.proxyPort + "/";
+      ret.remoteUrl = "http://localhost:" + ret.remotePort + "/";
+      ret.proxiedUrl = ret.homeUrl + "proxy/" + ret.remoteUrl;
+      next(null, ret);
+    }
+  );
+};
+
+exports.getData = function () {
+  return {
+    url: "http://example.com/",
+    contentType: "text/html",
+    headers: {},
+    stream: new PassThrough(),
+    clientRequest: {},
+    clientResponse: {},
+    remoteRequest: {},
+    remoteResponse: {
+      statusCode: 200,
+    },
+  };
+};
+
+"use strict";
+
+var fs = require("fs"),
+  concat = require("concat-stream"),
+  test = require("tap").test,
+  hyperquest = require("hyperquest"),
+  getServers = require("./test_utils.js").getServers;
+const express = require("express");
+const Unblocker = require("../lib/unblocker.js");
+
+var sourceContent = fs.readFileSync(__dirname + "/source/index.html");
+var expected = fs.readFileSync(__dirname + "/expected/index.html");
+
+test("url_rewriting should support support all kinds of links", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(servers.proxiedUrl)
+        .pipe(
+          concat(function (data) {
+            t.equal(
+              data.toString(),
+              expected.toString().replace(/<remotePort>/g, servers.remotePort)
+            );
+            cleanup();
+          })
+        )
+        .on("error", function (err) {
+          console.error("error retrieving data from proxy", err);
+          cleanup();
+        });
+    }
+  );
+});
+
+test("should return control to parent when route doesn't match and no referer is sent", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(servers.homeUrl)
+        .pipe(
+          concat(function (data) {
+            t.equal(
+              data.toString(),
+              "this is the home page",
+              servers.remotePort
+            );
+            cleanup();
+          })
+        )
+        .on("error", function (err) {
+          console.error("error retrieving robots.txt from proxy", err);
+          cleanup();
+        });
+    }
+  );
+});
+
+test("should redirect root-relative urls when the correct target can be determined from the referer header", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(
+        servers.homeUrl + "bar?query_param=new",
+        {
+          headers: {
+            referer: servers.proxiedUrl + "foo?query_param=old",
+          },
+        },
+        function (err, res) {
+          t.notOk(err);
+          t.equal(res.statusCode, 307, "http status code");
+          t.equal(
+            res.headers.location,
+            servers.proxiedUrl + "bar?query_param=new",
+            "redirect location"
+          );
+          cleanup();
+        }
+      );
+    }
+  );
+});
+
+test("should redirect root-relative urls when the correct target can be determined from the referer header including for urls that the site is already serving content on", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(
+        servers.homeUrl,
+        {
+          headers: {
+            referer: servers.proxiedUrl,
+          },
+        },
+        function (err, res) {
+          t.notOk(err);
+          t.equal(res.statusCode, 307, "http status code");
+          t.equal(
+            res.headers.location,
+            servers.proxiedUrl,
+            "redirect location"
+          );
+          cleanup();
+        }
+      );
+    }
+  );
+});
+
+test("should NOT redirect http urls that have had the slashes merged (http:/ instead of http:// (#130)", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(
+        servers.proxiedUrl.replace("/proxy/http://", "/proxy/http:/"),
+        function (err, res) {
+          t.notOk(err);
+          t.equal(res.statusCode, 200, "http status code");
+          t.notOk(res.headers.location, "no location header");
+          cleanup();
+        }
+      );
+    }
+  );
+});
+
+test("should redirect http urls that have had the have two occurrences of /prefix/http://", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(
+        servers.proxiedUrl.replace(
+          "/proxy/http://",
+          "/proxy/http://proxy/http://"
+        ),
+        function (err, res) {
+          t.notOk(err);
+          t.equal(res.statusCode, 307, "http status code");
+          t.equal(
+            res.headers.location,
+            servers.proxiedUrl,
+            "redirect location"
+          );
+          cleanup();
+        }
+      );
+    }
+  );
+});
+
+test("should redirect http urls that end in a TLD without a /", function (t) {
+  getServers(
+    { unblocker: new Unblocker({ clientScripts: false }), sourceContent },
+    function (err, servers) {
+      t.ifErr(err);
+      function cleanup() {
+        servers.kill(function () {
+          t.end();
+        });
+      }
+      hyperquest(
+        // strip the trailing /
+        servers.proxiedUrl.substr(0, servers.proxiedUrl.length - 1),
+        function (err, res) {
+          t.notOk(err);
+          t.equal(res.statusCode, 307, "http status code");
+          t.equal(
+            res.headers.location,
+            servers.proxiedUrl, // correct URL with the trailing /
+            "redirect location"
+          );
+          cleanup();
+        }
+      );
+    }
+  );
+});
+
+test("should redirect http urls that end in a TLD without a / when req.protocol is set", function (t) {
+  // express sets req.protocol
+  const app = express();
+  const unblocker = new Unblocker({});
+  app.use(unblocker);
+  getServers({ app, unblocker, sourceContent }, function (err, servers) {
+    t.ifErr(err);
+    function cleanup() {
+      servers.kill(function () {
+        t.end();
+      });
+    }
+    hyperquest(
+      // strip the trailing /
+      servers.proxiedUrl.substr(0, servers.proxiedUrl.length - 1),
+      function (err, res) {
+        t.notOk(err);
+        t.equal(res.statusCode, 307, "http status code");
+        t.equal(
+          res.headers.location,
+          servers.proxiedUrl, // correct URL with the trailing /
+          "redirect location"
+        );
+        cleanup();
+      }
+    );
+  });
+});
+
+"use strict";
+const { test } = require("tap");
+const prefix = "/proxy/";
+const proxy = "http://localhost";
+const target = "http://example.com/page.html?query#hash";
+const location = new URL(proxy + prefix + target);
+
+const config = (global.unblocker = { prefix, url: target });
+const { fixUrl } = require("../lib/client/unblocker-client.js");
+
+// 1x1 transparent gif
+const pixel =
+  " data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+
+const testCases = [
+  { url: "http://foo.com/", expected: "/proxy/http://foo.com/" },
+  { url: "/bar", expected: "/proxy/http://example.com/bar" },
+  { url: "baz", expected: "/proxy/http://example.com/baz" },
+  {
+    url: "/bar",
+    location: new URL(proxy + prefix + "http://example.com/bam/biz"),
+    expected: "/proxy/http://example.com/bar",
+  },
+  {
+    url: "baz",
+    location: new URL(proxy + prefix + "http://example.com/bam/biz"),
+    expected: "/proxy/http://example.com/bam/baz",
+  },
+  {
+    url: "../parent",
+    location: new URL(proxy + prefix + "http://example.com/foo/bar/"),
+    expected: "/proxy/http://example.com/foo/parent",
+  },
+  { url: "../too-high", expected: "/proxy/http://example.com/too-high" },
+  { url: "#", expected: "/proxy/http://example.com/page.html?query#" },
+  { url: "https://example.com/", expected: "/proxy/https://example.com/" },
+  // this is for when website js tries to be clever and use location.protocol + location.host + a new path.
+  { url: "http://localhost/path", expected: "/proxy/http://example.com/path" },
+  // don't break data: urls
+  { url: pixel, expected: pixel },
+  // don't break protocol-relative urls
+  { url: "//example.com/foo", expected: "/proxy/http://example.com/foo" },
+  // don't break about:blank urls
+  { url: "about:blank", expected: "about:blank" },
+  // don't break already proxied URLs
+  {
+    url: proxy + prefix + "http://example.com/foo",
+    expected: proxy + prefix + "http://example.com/foo",
+  },
+  {
+    url: prefix + "http://example.com/foo",
+    expected: prefix + "http://example.com/foo",
+  },
+  // todo: port numbers
+  // todo: more https tests
+  // todo: websockets(?)
+];
+
+testCases.forEach((tc) => {
+  test(JSON.stringify(tc), (t) => {
+    // todo: replace || with ??
+    const actual = fixUrl(tc.url, tc.config || config, tc.location || location);
+    t.equal(actual, tc.expected);
+    t.end();
+  });
+});
+
+// todo: something about cookies and subdomains
+
+"use strict";
+
+var URL = require("url"),
+  test = require("tap").test,
+  _ = require("lodash"),
+  concat = require("concat-stream");
+
+var urlPrefix = require("../lib/url-prefixer.js")({
+  prefix: "/proxy/",
+});
+
+var testLines = {
+  // source => expected result
+
+  // xmlns items first two should NOT get rewritten
+  '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en-us">':
+    '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en-us">',
+  '<head xmlns:og="http://ogp.me/ns#" xmlns:fb="http://ogp.me/ns/fb#">':
+    '<head xmlns:og="http://ogp.me/ns#" xmlns:fb="http://ogp.me/ns/fb#">',
+
+  '<link rel="stylesheet" href="http://example.com/styles.css"/>':
+    '<link rel="stylesheet" href="/proxy/http://example.com/styles.css"/>',
+  '<link rel="stylesheet" href="https://example.com/styles.css"/>':
+    '<link rel="stylesheet" href="/proxy/https://example.com/styles.css"/>',
+  '<link rel="stylesheet" href="//example.com/styles.css"/>':
+    '<link rel="stylesheet" href="/proxy/http://example.com/styles.css"/>',
+  '<link rel="stylesheet" href="/styles.css"/>':
+    '<link rel="stylesheet" href="/proxy/http://localhost:8081/styles.css"/>',
+  '<link rel="stylesheet" href="styles.css"/>':
+    '<link rel="stylesheet" href="styles.css"/>',
+
+  "<link rel=\"stylesheet\" href='http://example.com/styles.css'/>":
+    "<link rel=\"stylesheet\" href='/proxy/http://example.com/styles.css'/>",
+  "<link rel=\"stylesheet\" href='https://example.com/styles.css'/>":
+    "<link rel=\"stylesheet\" href='/proxy/https://example.com/styles.css'/>",
+  "<link rel=\"stylesheet\" href='//example.com/styles.css'/>":
+    "<link rel=\"stylesheet\" href='/proxy/http://example.com/styles.css'/>",
+  "<link rel=\"stylesheet\" href='/styles.css'/>":
+    "<link rel=\"stylesheet\" href='/proxy/http://localhost:8081/styles.css'/>",
+  "<link rel=\"stylesheet\" href='styles.css'/>":
+    "<link rel=\"stylesheet\" href='styles.css'/>",
+
+  '<link rel="stylesheet" href=http://example.com/styles.css />':
+    '<link rel="stylesheet" href=/proxy/http://example.com/styles.css />',
+  '<link rel="stylesheet" href=https://example.com/styles.css />':
+    '<link rel="stylesheet" href=/proxy/https://example.com/styles.css />',
+  '<link rel="stylesheet" href=//example.com/styles.css />':
+    '<link rel="stylesheet" href=/proxy/http://example.com/styles.css />',
+  '<link rel="stylesheet" href=/styles.css />':
+    '<link rel="stylesheet" href=/proxy/http://localhost:8081/styles.css />',
+  '<link rel="stylesheet" href=styles.css />':
+    '<link rel="stylesheet" href=styles.css />',
+
+  ".bg1 { background: url(http://example.com/img.jpg); }":
+    ".bg1 { background: url(/proxy/http://example.com/img.jpg); }",
+  ".bg2 { background: url(https://example.com/img.jpg); }":
+    ".bg2 { background: url(/proxy/https://example.com/img.jpg); }",
+  ".bg3 { background: url(//example.com/img.jpg); }":
+    ".bg3 { background: url(/proxy/http://example.com/img.jpg); }",
+  ".bg4 { background: url(/img.jpg); }":
+    ".bg4 { background: url(/proxy/http://localhost:8081/img.jpg); }",
+  ".bg5 { background: url(img.jpg); }": ".bg5 { background: url(img.jpg); }",
+  ".bg1 { background: url('http://example.com/img.jpg'); }":
+    ".bg1 { background: url('/proxy/http://example.com/img.jpg'); }",
+  ".bg2 { background: url('https://example.com/img.jpg'); }":
+    ".bg2 { background: url('/proxy/https://example.com/img.jpg'); }",
+  ".bg3 { background: url('//example.com/img.jpg'); }":
+    ".bg3 { background: url('/proxy/http://example.com/img.jpg'); }",
+  ".bg4 { background: url('/img.jpg'); }":
+    ".bg4 { background: url('/proxy/http://localhost:8081/img.jpg'); }",
+  ".bg5 { background: url('img.jpg'); }":
+    ".bg5 { background: url('img.jpg'); }",
+  '.bg1 { background: url("http://example.com/img.jpg"); }':
+    '.bg1 { background: url("/proxy/http://example.com/img.jpg"); }',
+  '.bg2 { background: url("https://example.com/img.jpg"); }':
+    '.bg2 { background: url("/proxy/https://example.com/img.jpg"); }',
+  '.bg3 { background: url("//example.com/img.jpg"); }':
+    '.bg3 { background: url("/proxy/http://example.com/img.jpg"); }',
+  '.bg4 { background: url("/img.jpg"); }':
+    '.bg4 { background: url("/proxy/http://localhost:8081/img.jpg"); }',
+  '.bg5 { background: url("img.jpg"); }':
+    '.bg5 { background: url("img.jpg"); }',
+  ".bg1 { background: url( http://example.com/img.jpg ); }":
+    ".bg1 { background: url( /proxy/http://example.com/img.jpg ); }",
+  ".bg2 { background: url( https://example.com/img.jpg ); }":
+    ".bg2 { background: url( /proxy/https://example.com/img.jpg ); }",
+  ".bg3 { background: url( //example.com/img.jpg ); }":
+    ".bg3 { background: url( /proxy/http://example.com/img.jpg ); }",
+  ".bg4 { background: url( /img.jpg ); }":
+    ".bg4 { background: url( /proxy/http://localhost:8081/img.jpg ); }",
+  ".bg5 { background: url( img.jpg ); }":
+    ".bg5 { background: url( img.jpg ); }",
+  ".bg1 { background: url( 'http://example.com/img.jpg' ); }":
+    ".bg1 { background: url( '/proxy/http://example.com/img.jpg' ); }",
+  ".bg2 { background: url( 'https://example.com/img.jpg' ); }":
+    ".bg2 { background: url( '/proxy/https://example.com/img.jpg' ); }",
+  ".bg3 { background: url( '//example.com/img.jpg' ); }":
+    ".bg3 { background: url( '/proxy/http://example.com/img.jpg' ); }",
+  ".bg4 { background: url( '/img.jpg' ); }":
+    ".bg4 { background: url( '/proxy/http://localhost:8081/img.jpg' ); }",
+  ".bg5 { background: url( 'img.jpg' ); }":
+    ".bg5 { background: url( 'img.jpg' ); }",
+  '.bg1 { background: url( "http://example.com/img.jpg" ); }':
+    '.bg1 { background: url( "/proxy/http://example.com/img.jpg" ); }',
+  '.bg2 { background: url( "https://example.com/img.jpg" ); }':
+    '.bg2 { background: url( "/proxy/https://example.com/img.jpg" ); }',
+  '.bg3 { background: url( "//example.com/img.jpg" ); }':
+    '.bg3 { background: url( "/proxy/http://example.com/img.jpg" ); }',
+  '.bg4 { background: url( "/img.jpg" ); }':
+    '.bg4 { background: url( "/proxy/http://localhost:8081/img.jpg" ); }',
+  '.bg5 { background: url( "img.jpg" ); }':
+    '.bg5 { background: url( "img.jpg" ); }',
+  '.bg4 { background: url(   "/img.jpg"   ); }':
+    '.bg4 { background: url(   "/proxy/http://localhost:8081/img.jpg"   ); }',
+  '.bg4 { background: url( "/img.jpg"  ); }':
+    '.bg4 { background: url( "/proxy/http://localhost:8081/img.jpg"  ); }',
+
+  '<script src="http://example.com/scripts.js"></script>':
+    '<script src="/proxy/http://example.com/scripts.js"></script>',
+  '<script src="https://example.com/scripts.js"></script>':
+    '<script src="/proxy/https://example.com/scripts.js"></script>',
+  '<script src="//example.com/scripts.js"></script>':
+    '<script src="/proxy/http://example.com/scripts.js"></script>',
+  '<script src="/scripts.js"></script>':
+    '<script src="/proxy/http://localhost:8081/scripts.js"></script>',
+  '<script src="scripts.js"></script>': '<script src="scripts.js"></script>',
+
+  "<script src='http://example.com/scripts.js'></script>":
+    "<script src='/proxy/http://example.com/scripts.js'></script>",
+  "<script src='https://example.com/scripts.js'></script>":
+    "<script src='/proxy/https://example.com/scripts.js'></script>",
+  "<script src='//example.com/scripts.js'></script>":
+    "<script src='/proxy/http://example.com/scripts.js'></script>",
+  "<script src='/scripts.js'></script>":
+    "<script src='/proxy/http://localhost:8081/scripts.js'></script>",
+  "<script src='scripts.js'></script>": "<script src='scripts.js'></script>",
+
+  "<script src=http://example.com/scripts.js></script>":
+    "<script src=/proxy/http://example.com/scripts.js></script>",
+  "<script src=https://example.com/scripts.js></script>":
+    "<script src=/proxy/https://example.com/scripts.js></script>",
+  "<script src=//example.com/scripts.js></script>":
+    "<script src=/proxy/http://example.com/scripts.js></script>",
+  "<script src=/scripts.js></script>":
+    "<script src=/proxy/http://localhost:8081/scripts.js></script>",
+  "<script src=scripts.js></script>": "<script src=scripts.js></script>",
+
+  '<a href="/site/http/page.html">link with "http" in the url</a>':
+    '<a href="/proxy/http://localhost:8081/site/http/page.html">link with "http" in the url</a>',
+  '<a href="/site/https/page.html">link with "https" in the url</a>':
+    '<a href="/proxy/http://localhost:8081/site/https/page.html">link with "https" in the url</a>',
+  '<a href="http://localhost:8080">link with port number</a>':
+    '<a href="/proxy/http://localhost:8080">link with port number</a>',
+
+  '<a href="/">link to site root</a>':
+    '<a href="/proxy/http://localhost:8081/">link to site root</a>',
+
+  '<a href="#anchor">link to anchor</a>':
+    '<a href="#anchor">link to anchor</a>',
+  '<a href="http://example.com/#anchor">offsite link with anchor</a>':
+    '<a href="/proxy/http://example.com/#anchor">offsite link with anchor</a>',
+  '<a href="/#anchor">link to site root with anchor</a>':
+    '<a href="/proxy/http://localhost:8081/#anchor">link to site root with anchor</a>',
+
+  '<form action="">': '<form action="">',
+  '<form action="/mytarget">':
+    '<form action="/proxy/http://localhost:8081/mytarget">',
+  '<form action="mytarget.php">': '<form action="mytarget.php">',
+
+  // yes, this is a real thing. https://developer.mozilla.org/en-US/docs/Web/HTML/Element/button#attr-formaction
+  '<button formaction="">': '<button formaction="">',
+  '<button formaction="/mytarget">':
+    '<button formaction="/proxy/http://localhost:8081/mytarget">',
+  '<button formaction="mytarget.php">': '<button formaction="mytarget.php">',
+};
+
+var testUri = URL.parse("http://localhost:8081/");
+var testPrefix = "/proxy/";
+
+test("should rewrite (or not rewrite) various strings correctly", function (t) {
+  _.each(testLines, function (expected, source) {
+    var actual = urlPrefix.rewriteUrls(source, testUri, testPrefix);
+    t.equal(
+      actual,
+      expected,
+      "Should rewrite '" + source + "' to '" + expected + '"'
+    );
+  });
+  t.end();
+});
+
+test("should correctly handle packets split at different locations", function (t) {
+  var fullSource = _.keys(testLines).join("\n"),
+    expected = _.values(testLines).join("\n");
+
+  function createSubTest(start, end) {
+    // this causes the following warning:
+    // (node) warning: Recursive process.nextTick detected. This will break in the next version of node. Please use setImmediate for recursive deferral.
+    //t.test("Should handle breaks between '" + start.substr(-20) + "' and '" + end.substr(0,20) + "' correctly", function(t) {
+    var stream = urlPrefix.createStream(testUri);
+    stream.setEncoding("utf8");
+    stream.pipe(
+      concat(function (actual) {
+        t.equal(
+          actual,
+          expected,
+          "Should handle chunk breaks between '" +
+            start.substr(-20) +
+            "' and '" +
+            end.substr(0, 20) +
+            "' correctly"
+        );
+        if (actual != expected) throw "stopping early";
+      })
+    );
+    stream.write(start);
+    stream.end(end);
+    //});
+  }
+
+  t.plan(fullSource.length);
+  for (
+    var splitLocation = 0, l = fullSource.length;
+    splitLocation < l;
+    splitLocation++
+  ) {
+    var start = fullSource.substr(0, splitLocation);
+    var end = fullSource.substr(splitLocation);
+    createSubTest(start, end);
+  }
+});
+
+// todo: add tests for javascript (?)
+
+"use strict";
+
+var fs = require("fs"),
+  test = require("tap").test,
+  getServers = require("./test_utils.js").getServers;
+const WebSocket = require("ws");
+
+var sourceContent = fs.readFileSync(__dirname + "/source/index.html");
+
+test("it should pass text messages over a websocket connection", function (t) {
+  t.plan(3);
+  getServers({ sourceContent }, function (err, servers) {
+    t.error(err);
+
+    const wss = new WebSocket.Server({ server: servers.remoteServer });
+    wss.on("connection", function connection(ws) {
+      ws.on("message", function incoming(message) {
+        t.equal(message, "message from client");
+      });
+
+      ws.send("message from server");
+    });
+
+    const wsurl = new URL(servers.proxiedUrl);
+    wsurl.protocol = "ws:";
+    const ws = new WebSocket(wsurl.href);
+
+    ws.on("open", function open() {
+      ws.send("message from client");
+    });
+
+    ws.on("message", function incoming(message) {
+      t.equal(message, "message from server");
+      ws.close();
+      servers.kill(function () {
+        t.end();
+      });
+    });
+  });
+});
+
+test("it should pass binary messages over a websocket connection", function (t) {
+  t.plan(3);
+  getServers({ sourceContent }, function (err, servers) {
+    t.error(err);
+
+    const wss = new WebSocket.Server({ server: servers.remoteServer });
+    wss.on("connection", function connection(ws) {
+      ws.on("message", function incoming(message) {
+        t.same(Uint8Array.from(message), Uint8Array.from([1, 2, 3, 4, 5]));
+      });
+
+      ws.send(Uint8Array.from([5, 4, 3, 2, 1]));
+    });
+
+    const wsurl = new URL(servers.proxiedUrl);
+    wsurl.protocol = "ws:";
+    const ws = new WebSocket(wsurl.href);
+
+    ws.on("open", function open() {
+      ws.send(Uint8Array.from([1, 2, 3, 4, 5]));
+    });
+
+    ws.on("message", function incoming(message) {
+      t.same(Uint8Array.from(message), Uint8Array.from([5, 4, 3, 2, 1]));
+      ws.close();
+      servers.kill(function () {
+        t.end();
+      });
+    });
+  });
+});
+
+test("it should forward the path in a websocket requests", function (t) {
+  t.plan(2);
+  getServers({ sourceContent }, function (err, servers) {
+    t.error(err);
+
+    const wss = new WebSocket.Server({ server: servers.remoteServer });
+    wss.on("connection", function connection(ws, req) {
+      t.equal(req.url, "/websocket-path");
+      ws.close();
+      servers.kill(function () {
+        t.end();
+      });
+    });
+
+    const wsurl = new URL(servers.proxiedUrl + "websocket-path");
+    wsurl.protocol = "ws:";
+    new WebSocket(wsurl.href);
+  });
+
+  test("it should forward the path in a websocket requests when the prefix is missing but a referer header is avaliable", function (t) {
+    t.plan(2);
+    getServers({ sourceContent }, function (err, servers) {
+      t.error(err);
+
+      const wss = new WebSocket.Server({ server: servers.remoteServer });
+      wss.on("connection", function connection(ws, req) {
+        t.equal(req.url, "/websocket-path");
+        ws.close();
+        servers.kill(function () {
+          t.end();
+        });
+      });
+
+      const wsurl = new URL(servers.homeUrl + "websocket-path");
+      wsurl.protocol = "ws:";
+      new WebSocket(wsurl.href, { headers: { referer: servers.proxiedUrl } });
+    });
+  });
+
+  test("it should close the connection when unable to determine the target url", function (t) {
+    t.plan(2);
+    getServers({ sourceContent }, function (err, servers) {
+      t.error(err);
+
+      const wsurl = new URL(servers.homeUrl + "websocket-path");
+      wsurl.protocol = "ws:";
+      const ws = new WebSocket(wsurl.href);
+      ws.on("unexpected-response", (req, res) => {
+        t.equal(res.statusCode, 400);
+        servers.kill(function () {
+          t.end();
+        });
+      });
+    });
+  });
+
+  test("it should forward the close reason from the client to the remote server", function (t) {
+    t.plan(5);
+    getServers({ sourceContent }, function (err, servers) {
+      t.error(err);
+
+      const wss = new WebSocket.Server({ server: servers.remoteServer });
+      wss.on("connection", function connection(ws /*, req*/) {
+        t.ok(ws, "server connection event");
+        ws.on("close", function (code, reason) {
+          t.equal(code, 1008);
+          t.equal(reason, "Policy Violation (sent from client)");
+          servers.kill(function () {
+            t.end();
+          });
+        });
+      });
+
+      const wsurl = new URL(servers.proxiedUrl + "websocket-path");
+      wsurl.protocol = "ws:";
+      const wsc = new WebSocket(wsurl.href);
+      wsc.on("open", function () {
+        t.ok(true, "client open event");
+        wsc.close(1008, "Policy Violation (sent from client)");
+      });
+    });
+  });
+
+  test("it should forward the close reason from the remote server to the client", function (t) {
+    t.plan(4);
+    getServers({ sourceContent }, function (err, servers) {
+      t.error(err);
+
+      const wss = new WebSocket.Server({ server: servers.remoteServer });
+      wss.on("connection", function connection(ws /*, req*/) {
+        t.ok(ws, "server connection event");
+        ws.close(1008, "Policy Violation (sent from server)");
+      });
+
+      const wsurl = new URL(servers.proxiedUrl + "websocket-path");
+      wsurl.protocol = "ws:";
+      const wsc = new WebSocket(wsurl.href);
+      wsc.on("close", function (code, reason) {
+        t.equal(code, 1008);
+        t.equal(reason, "Policy Violation (sent from server)");
+        servers.kill(function () {
+          t.end();
+        });
+      });
+    });
+  });
+  // todo: close cleanly from client, ensure server connection is closed cleanly and vice versa
+  // todo: exit abruptly from client, ensure server connection is closed cleanly and vice versa
+});
